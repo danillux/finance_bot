@@ -1,10 +1,17 @@
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters
+)
 from datetime import datetime
 import psycopg2
 import os
 
-# --- Подключение к базе данных ---
+# --- Подключение к базе PostgreSQL ---
 conn = psycopg2.connect(
     host=os.getenv("DB_HOST"),
     database=os.getenv("DB_NAME"),
@@ -13,7 +20,7 @@ conn = psycopg2.connect(
 )
 cursor = conn.cursor()
 
-# Создаём таблицу, если её нет
+# --- Создание таблиц, если их нет ---
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS expenses (
     id SERIAL PRIMARY KEY,
@@ -21,11 +28,28 @@ CREATE TABLE IF NOT EXISTS expenses (
     date TIMESTAMP NOT NULL,
     amount NUMERIC NOT NULL,
     category TEXT NOT NULL
-)
+);
+""")
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS income (
+    id SERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    date TIMESTAMP NOT NULL,
+    amount NUMERIC NOT NULL
+);
 """)
 conn.commit()
 
-# --- /start ---
+# --- Функция для создания кнопок ---
+def get_main_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("💰 Принять доходы", callback_data="income")],
+        [InlineKeyboardButton("📊 Показать расходы с момента доходов", callback_data="expenses")],
+        [InlineKeyboardButton("💵 Показать остаток", callback_data="balance")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# --- /start с кнопками сразу ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Привет!\n\n"
@@ -33,59 +57,90 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Просто отправь сообщение в формате:\n"
         "`500 еда`\n"
         "`1200 аренда`\n\n"
-        "Или используй /menu для кнопок 📊",
-        parse_mode="Markdown"
+        "Выбери действие в меню ниже ⬇️",
+        parse_mode="Markdown",
+        reply_markup=get_main_keyboard()  # кнопки сразу при старте
     )
-
-# --- Меню кнопок ---
-async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("💰 Принять доходы", callback_data="income")],
-        [InlineKeyboardButton("📊 Показать расходы с момента доходов", callback_data="expenses")],
-        [InlineKeyboardButton("💵 Показать остаток", callback_data="balance")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Выбери действие:", reply_markup=reply_markup)
 
 # --- Обработчик кнопок ---
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
-    user = query.from_user
-    user_id = user.id
+    user_id = query.from_user.id
 
     if query.data == "income":
         await query.edit_message_text("💰 Введи сумму дохода:")
         context.user_data['awaiting_income'] = True
 
     elif query.data == "expenses":
-        cursor.execute("SELECT SUM(amount) FROM expenses WHERE user_id=%s", (user_id,))
+        # Получаем дату последнего дохода
+        cursor.execute(
+            "SELECT date FROM income WHERE user_id=%s ORDER BY date DESC LIMIT 1",
+            (user_id,)
+        )
+        row = cursor.fetchone()
+        if row:
+            last_income_date = row[0]
+            cursor.execute(
+                "SELECT SUM(amount) FROM expenses WHERE user_id=%s AND date >= %s",
+                (user_id, last_income_date)
+            )
+        else:
+            cursor.execute(
+                "SELECT SUM(amount) FROM expenses WHERE user_id=%s",
+                (user_id,)
+            )
         total_expenses = cursor.fetchone()[0] or 0
-        await query.edit_message_text(f"📊 Расходы с момента доходов: {total_expenses} zł")
+        await query.edit_message_text(
+            f"📊 Расходы с момента доходов: {total_expenses} zł",
+            reply_markup=get_main_keyboard()  # повторно показываем кнопки
+        )
 
     elif query.data == "balance":
-        income = context.user_data.get("income", 0)
-        cursor.execute("SELECT SUM(amount) FROM expenses WHERE user_id=%s", (user_id,))
-        total_expenses = cursor.fetchone()[0] or 0
-        balance = income - total_expenses
-        await query.edit_message_text(f"💵 Остаток: {balance} zł")
+        # Последний доход
+        cursor.execute(
+            "SELECT amount, date FROM income WHERE user_id=%s ORDER BY date DESC LIMIT 1",
+            (user_id,)
+        )
+        row = cursor.fetchone()
+        if row:
+            last_income, last_income_date = row
+            cursor.execute(
+                "SELECT SUM(amount) FROM expenses WHERE user_id=%s AND date >= %s",
+                (user_id, last_income_date)
+            )
+            total_expenses = cursor.fetchone()[0] or 0
+            balance = last_income - total_expenses
+            await query.edit_message_text(
+                f"💵 Остаток: {balance} zł",
+                reply_markup=get_main_keyboard()  # повторно показываем кнопки
+            )
+        else:
+            await query.edit_message_text(
+                "❌ Доходы не заданы. Сначала введите доход.",
+                reply_markup=get_main_keyboard()  # повторно показываем кнопки
+            )
 
 # --- Обработчик сообщений ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    user_id = user.id
+    user_id = update.effective_user.id
     text = update.message.text.strip()
 
-    # --- Если ждем доход ---
+    # --- Проверка, ждём ли доход ---
     if context.user_data.get("awaiting_income"):
         try:
             income = float(text)
-            context.user_data['income'] = income
+            cursor.execute(
+                "INSERT INTO income (user_id, date, amount) VALUES (%s, NOW(), %s)",
+                (user_id, income)
+            )
+            conn.commit()
             context.user_data['awaiting_income'] = False
-            await update.message.reply_text(f"✅ Доход записан: {income} zł")
+            await update.message.reply_text(f"✅ Доход записан: {income} zł",
+                                            reply_markup=get_main_keyboard())
         except:
-            await update.message.reply_text("❌ Введите число для дохода")
+            await update.message.reply_text("❌ Введите число для дохода",
+                                            reply_markup=get_main_keyboard())
         return
 
     # --- Иначе считаем расход ---
@@ -98,19 +153,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             (user_id, amount, category)
         )
         conn.commit()
-
-        await update.message.reply_text(f"✅ Записал: {amount} zł — {category}")
+        await update.message.reply_text(f"✅ Записал: {amount} zł — {category}",
+                                        reply_markup=get_main_keyboard())
     except:
         await update.message.reply_text(
             "❌ Формат неверный\nНапиши так:\n`500 еда`",
-            parse_mode='Markdown'
+            parse_mode='Markdown',
+            reply_markup=get_main_keyboard()
         )
 
 # --- Создание и запуск приложения ---
 TOKEN = os.getenv("BOT_TOKEN")
 app = ApplicationBuilder().token(TOKEN).build()
 app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("menu", menu))
 app.add_handler(CallbackQueryHandler(button_handler))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
