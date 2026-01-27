@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS income (
 conn.commit()
 
 # --- HTTP-сервер для Render ---
-PORT = int(os.getenv("PORT", 10000))  # Render автоматически задаёт PORT
+PORT = int(os.getenv("PORT", 10000))  # Render требует PORT для Web Service
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -53,7 +53,7 @@ def run_server():
     server = HTTPServer(('0.0.0.0', PORT), Handler)
     server.serve_forever()
 
-Thread(target=run_server, daemon=True).start()  # запускаем сервер в фоне
+Thread(target=run_server, daemon=True).start()  # сервер в фоне
 
 # --- Функция для кнопок ---
 def get_main_keyboard():
@@ -84,7 +84,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
 
     if query.data == "income":
-        await query.edit_message_text("💰 Введи сумму дохода:")
+        await query.edit_message_text(
+            "💰 Введи сумму дохода:",
+            reply_markup=get_main_keyboard()
+        )
         context.user_data['awaiting_income'] = True
 
     elif query.data == "expenses":
@@ -149,11 +152,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             conn.commit()
             context.user_data['awaiting_income'] = False
-            await update.message.reply_text(f"✅ Доход записан: {income} zł",
-                                            reply_markup=get_main_keyboard())
+            await update.message.reply_text(
+                f"✅ Доход записан: {income} zł",
+                reply_markup=get_main_keyboard()
+            )
         except:
-            await update.message.reply_text("❌ Введите число для дохода",
-                                            reply_markup=get_main_keyboard())
+            await update.message.reply_text(
+                "❌ Введите число для дохода",
+                reply_markup=get_main_keyboard()
+            )
         return
 
     # --- Иначе считаем расход ---
@@ -165,8 +172,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             (user_id, amount, category)
         )
         conn.commit()
-        await update.message.reply_text(f"✅ Записал: {amount} zł — {category}",
-                                        reply_markup=get_main_keyboard())
+        await update.message.reply_text(
+            f"✅ Записал: {amount} zł — {category}",
+            reply_markup=get_main_keyboard()
+        )
     except:
         await update.message.reply_text(
             "❌ Формат неверный\nНапиши так:\n`500 еда`",
