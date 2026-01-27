@@ -1,263 +1,198 @@
-import os
-from threading import Thread
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import (
+    ApplicationBuilder,
+    ContextTypes,
+    CommandHandler,
+    MessageHandler,
+    filters,
+)
 from datetime import datetime
+import csv
+import os
 
-import psycopg2
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
-
-# НАСТРОЙКИ
 TOKEN = os.getenv("BOT_TOKEN")
-PORT = int(os.getenv("PORT", 10000))
 
-conn = psycopg2.connect(
-    host=os.getenv("DB_HOST"),
-    database=os.getenv("DB_NAME"),
-    user=os.getenv("DB_USER"),
-    password=os.getenv("DB_PASSWORD")
-)
-cursor = conn.cursor()
-
-# HTTP (Render)
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-
-Thread(
-    target=lambda: HTTPServer(("0.0.0.0", PORT), Handler).serve_forever(),
-    daemon=True
-).start()
-
-# БАЗА
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS profile (
-    user_id BIGINT PRIMARY KEY,
-    username TEXT,
-    balance NUMERIC DEFAULT 0,
-    month TEXT
-)
-""")
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS operations (
-    id SERIAL PRIMARY KEY,
-    user_id BIGINT,
-    date TIMESTAMP,
-    amount NUMERIC,
-    type TEXT,
-    category TEXT
-)
-""")
-
-conn.commit()
-
-# КЛАВИАТУРА
-keyboard = ReplyKeyboardMarkup(
+# ---------- КНОПКИ ----------
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
-        ["👤 Профиль"],
-        ["💰 Принять доходы", "📊 Статистика"],
-        ["💵 Показать остаток"]
+        [KeyboardButton("👤 Профиль")],
+        [KeyboardButton("💰 Принять доход")],
+        [KeyboardButton("📊 Показать расходы")],
+        [KeyboardButton("💵 Показать остаток")],
+        [KeyboardButton("❌ Отмена")],
     ],
-    resize_keyboard=True
+    resize_keyboard=True,
 )
 
-# ВСПОМОГАТЕЛЬНОЕ
-def current_month():
-    return datetime.now().strftime("%Y-%m")
+# ---------- ВСПОМОГАТЕЛЬНЫЕ ----------
+def get_file(user_id):
+    return f"finance_{user_id}.csv"
 
-def ensure_profile(user):
-    cursor.execute("SELECT month FROM profile WHERE user_id=%s", (user.id,))
-    row = cursor.fetchone()
 
-    if not row:
-        cursor.execute(
-            "INSERT INTO profile VALUES (%s,%s,0,%s)",
-            (user.id, user.username, current_month())
-        )
-        conn.commit()
-        return
+def init_file(user_id):
+    file = get_file(user_id)
+    if not os.path.exists(file):
+        with open(file, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["date", "type", "amount", "category"])
 
-    if row[0] != current_month():
-        cursor.execute(
-            "UPDATE profile SET month=%s WHERE user_id=%s",
-            (current_month(), user.id)
-        )
-        cursor.execute(
-            "DELETE FROM operations WHERE user_id=%s",
-            (user.id,)
-        )
-        conn.commit()
 
-# /start
+def read_data(user_id):
+    init_file(user_id)
+    data = []
+    with open(get_file(user_id), encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            data.append(row)
+    return data
+
+
+def write_row(user_id, row):
+    init_file(user_id)
+    with open(get_file(user_id), "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(row)
+
+
+def calculate_balance(data):
+    balance = 0
+    expenses = 0
+    income = 0
+    for row in data:
+        amount = float(row["amount"])
+        if row["type"] == "income":
+            balance += amount
+            income += amount
+        else:
+            balance -= amount
+            expenses += amount
+    return balance, income, expenses
+
+
+# ---------- КОМАНДЫ ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ensure_profile(update.effective_user)
+    context.user_data.clear()
     await update.message.reply_text(
         "👋 Привет!\n\n"
-        "Я бот для учёта финансов 💸\n"
-        "Расходы вводи так: `500 еда`",
-        reply_markup=keyboard,
-        parse_mode="Markdown"
+        "Я бот для учёта финансов 💸\n\n"
+        "• Доходы\n"
+        "• Расходы\n"
+        "• Баланс и статистика\n\n"
+        "Выбирай действие кнопками ниже 👇",
+        reply_markup=MAIN_KEYBOARD,
     )
 
-# ОБРАБОТКА
-async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text(
+        "❌ Действие отменено",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+# ---------- ОСНОВНОЙ ОБРАБОТЧИК ----------
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     user = update.effective_user
-    ensure_profile(user)
+    user_id = user.id
+    data = read_data(user_id)
+
+    # ---------- ОТМЕНА ----------
+    if text == "❌ Отмена":
+        context.user_data.clear()
+        await update.message.reply_text("❌ Всё отменено", reply_markup=MAIN_KEYBOARD)
+        return
 
     # ---------- ПРОФИЛЬ ----------
     if text == "👤 Профиль":
-        cursor.execute("SELECT balance FROM profile WHERE user_id=%s", (user.id,))
-        balance = cursor.fetchone()[0]
-
-        cursor.execute("""
-            SELECT COALESCE(SUM(amount),0)
-            FROM operations
-            WHERE user_id=%s AND type='expense'
-        """, (user.id,))
-        expenses = cursor.fetchone()[0]
-
-        cursor.execute("""
-            SELECT date, amount
-            FROM operations
-            WHERE user_id=%s AND type='income'
-            ORDER BY date DESC
-            LIMIT 5
-        """, (user.id,))
-        incomes = cursor.fetchall()
-
-        history = "\n".join(
-            [f"• {d:%d.%m} +{a} zł" for d, a in incomes]
-        ) or "нет"
-
+        balance, income, expenses = calculate_balance(data)
         await update.message.reply_text(
-            f"👤 @{user.username}\n\n"
-            f"💵 Баланс: {balance} zł\n"
-            f"📊 Расходы за месяц: {expenses} zł\n\n"
-            f"💰 Последние доходы:\n{history}",
-            reply_markup=keyboard
+            f"👤 *Профиль*\n\n"
+            f"Имя: {user.first_name}\n"
+            f"💰 Доходы: {income:.2f} zł\n"
+            f"📉 Расходы: {expenses:.2f} zł\n"
+            f"💵 Баланс: {balance:.2f} zł",
+            parse_mode="Markdown",
         )
         return
 
-    # ---------- ДОХОД ----------
-    if text == "💰 Принять доходы":
+    # ---------- ПРИНЯТЬ ДОХОД ----------
+    if text == "💰 Принять доход":
+        context.user_data.clear()
         context.user_data["awaiting_income"] = True
         await update.message.reply_text("💰 Введите сумму дохода:")
         return
 
+    # ---------- ПОКАЗАТЬ РАСХОДЫ ----------
+    if text == "📊 Показать расходы":
+        _, _, expenses = calculate_balance(data)
+        await update.message.reply_text(f"📊 Всего расходов: {expenses:.2f} zł")
+        return
+
+    # ---------- ПОКАЗАТЬ ОСТАТОК ----------
+    if text == "💵 Показать остаток":
+        balance, _, _ = calculate_balance(data)
+        await update.message.reply_text(f"💵 Текущий баланс: {balance:.2f} zł")
+        return
+
+    # ---------- ВВОД ДОХОДА ----------
     if context.user_data.get("awaiting_income"):
         try:
-            value = float(text)
-            if value <= 0:
+            amount = float(text)
+            if amount <= 0:
                 raise ValueError
-
-            cursor.execute(
-                "UPDATE profile SET balance = balance + %s WHERE user_id=%s",
-                (value, user.id)
+            write_row(
+                user_id,
+                [datetime.now(), "income", amount, "доход"],
             )
-            cursor.execute(
-                "INSERT INTO operations VALUES (DEFAULT,%s,NOW(),%s,'income',NULL)",
-                (user.id, value)
+            context.user_data.clear()
+            await update.message.reply_text(
+                f"✅ Доход {amount:.2f} zł добавлен",
+                reply_markup=MAIN_KEYBOARD,
             )
-            conn.commit()
-
-            context.user_data["awaiting_income"] = False
-            await update.message.reply_text(f"✅ Доход +{value} zł", reply_markup=keyboard)
         except:
             await update.message.reply_text("❌ Введите корректное число")
         return
 
-    # ---------- СТАТИСТИКА ----------
-    if text == "📊 Статистика":
-        cursor.execute("""
-            SELECT COUNT(*) FROM operations
-            WHERE user_id=%s AND type='expense'
-        """, (user.id,))
-        count = cursor.fetchone()[0]
-
-        cursor.execute("""
-            SELECT category, SUM(amount)
-            FROM operations
-            WHERE user_id=%s AND type='expense'
-            GROUP BY category
-            ORDER BY SUM(amount) DESC
-            LIMIT 5
-        """, (user.id,))
-        categories = cursor.fetchall()
-
-        cursor.execute("""
-            SELECT MAX(amount)
-            FROM operations
-            WHERE user_id=%s AND type='expense'
-        """, (user.id,))
-        max_expense = cursor.fetchone()[0] or 0
-
-        cat_text = "\n".join(
-            [f"• {c}: {a} zł" for c, a in categories]
-        ) or "нет"
-
-        await update.message.reply_text(
-            "📊 *Статистика за месяц*\n\n"
-            f"🧾 Кол-во расходов: {count}\n"
-            f"💸 Самый большой расход: {max_expense} zł\n\n"
-            f"🏷 Топ категорий:\n{cat_text}",
-            parse_mode="Markdown",
-            reply_markup=keyboard
-        )
-        return
-
-    # ---------- ОСТАТОК ----------
-    if text == "💵 Показать остаток":
-        cursor.execute("SELECT balance FROM profile WHERE user_id=%s", (user.id,))
-        balance = cursor.fetchone()[0]
-        await update.message.reply_text(f"💵 Остаток: {balance} zł", reply_markup=keyboard)
-        return
-
-    # ---------- РАСХОД ----------
+    # ---------- ВВОД РАСХОДА ----------
     try:
         amount, category = text.split(maxsplit=1)
         amount = float(amount)
 
+        balance, _, _ = calculate_balance(data)
         if amount <= 0:
             raise ValueError
 
-        cursor.execute("SELECT balance FROM profile WHERE user_id=%s", (user.id,))
-        balance = cursor.fetchone()[0]
-
-        if amount > balance:
+        if balance - amount < 0:
             await update.message.reply_text(
-                f"❌ Недостаточно средств\nБаланс: {balance} zł",
-                reply_markup=keyboard
+                "🚫 Недостаточно средств.\n"
+                f"Текущий баланс: {balance:.2f} zł"
             )
             return
 
-        cursor.execute(
-            "UPDATE profile SET balance = balance - %s WHERE user_id=%s",
-            (amount, user.id)
+        write_row(
+            user_id,
+            [datetime.now(), "expense", amount, category],
         )
-        cursor.execute(
-            "INSERT INTO operations VALUES (DEFAULT,%s,NOW(),%s,'expense',%s)",
-            (user.id, amount, category)
-        )
-        conn.commit()
-
         await update.message.reply_text(
-            f"✅ Расход: {amount} zł — {category}",
-            reply_markup=keyboard
+            f"✅ Расход {amount:.2f} zł — {category}",
+            reply_markup=MAIN_KEYBOARD,
         )
+
     except:
         await update.message.reply_text(
-            "❌ Формат: `500 еда`",
-            parse_mode="Markdown"
+            "❌ Формат расхода:\n`500 еда`",
+            parse_mode="Markdown",
         )
 
-# ЗАПУСК
-app = ApplicationBuilder().token(TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
 
-print("Бот запущен")
+# ---------- ЗАПУСК ----------
+app = ApplicationBuilder().token(TOKEN).build()
+
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("cancel", cancel))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+print("Бот запущен...")
 app.run_polling()
