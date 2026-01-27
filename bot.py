@@ -12,9 +12,7 @@ from telegram.ext import (
 import psycopg2
 from datetime import datetime
 
-# -------------------
 # Подключение к базе PostgreSQL
-# -------------------
 conn = psycopg2.connect(
     host=os.getenv("DB_HOST"),
     database=os.getenv("DB_NAME"),
@@ -43,9 +41,7 @@ CREATE TABLE IF NOT EXISTS income (
 """)
 conn.commit()
 
-# -------------------
 # HTTP сервер для Render
-# -------------------
 PORT = int(os.getenv("PORT", 10000))
 
 class Handler(BaseHTTPRequestHandler):
@@ -60,29 +56,24 @@ def run_server():
 
 Thread(target=run_server, daemon=True).start()
 
-# -------------------
-# Клавиатура снизу (ReplyKeyboard)
-# -------------------
+# Клавиатура снизу
 keyboard = [
     ["💰 Принять доходы", "📊 Показать расходы"],
     ["💵 Показать остаток"]
 ]
 reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-# -------------------
 # Команда /start
-# -------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Привет!\n"
         "Я бот для учёта расходов 💸\n"
         "Используй кнопки ниже или вводи расходы вручную, например: `500 еда`",
+        parse_mode="Markdown",
         reply_markup=reply_markup
     )
 
-# -------------------
 # Обработчик кнопок ReplyKeyboard
-# -------------------
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     user_id = update.effective_user.id
@@ -129,9 +120,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text("❌ Доходы не заданы. Сначала введите доход.", reply_markup=reply_markup)
 
-# -------------------
 # Обработчик сообщений (расходы и доход)
-# -------------------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text.strip()
@@ -164,9 +153,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         await update.message.reply_text("❌ Формат неверный\nНапиши так: `500 еда`", reply_markup=reply_markup)
 
-# -------------------
 # Запуск бота
-# -------------------
 TOKEN = os.getenv("BOT_TOKEN")
 app = ApplicationBuilder().token(TOKEN).build()
 
