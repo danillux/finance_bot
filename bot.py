@@ -1,10 +1,29 @@
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from datetime import datetime
-import csv
+import psycopg2
 import os
 
-TOKEN = os.getenv("BOT_TOKEN")  # В Render добавь ENV переменную BOT_TOKEN
+# --- Подключение к базе данных ---
+conn = psycopg2.connect(
+    host=os.getenv("DB_HOST"),
+    database=os.getenv("DB_NAME"),
+    user=os.getenv("DB_USER"),
+    password=os.getenv("DB_PASSWORD")
+)
+cursor = conn.cursor()
+
+# Создаём таблицу, если её нет
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS expenses (
+    id SERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    date TIMESTAMP NOT NULL,
+    amount NUMERIC NOT NULL,
+    category TEXT NOT NULL
+)
+""")
+conn.commit()
 
 # --- /start ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -18,7 +37,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# --- меню кнопок ---
+# --- Меню кнопок ---
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("💰 Принять доходы", callback_data="income")],
@@ -28,52 +47,37 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("Выбери действие:", reply_markup=reply_markup)
 
-# --- обработчик кнопок ---
+# --- Обработчик кнопок ---
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
     user = query.from_user
-    file_name = f"expenses_{user.id}.csv"
+    user_id = user.id
 
     if query.data == "income":
         await query.edit_message_text("💰 Введи сумму дохода:")
         context.user_data['awaiting_income'] = True
 
     elif query.data == "expenses":
-        total_expenses = 0
-        if os.path.exists(file_name):
-            with open(file_name, 'r', encoding='utf-8') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    total_expenses += float(row['amount'])
+        cursor.execute("SELECT SUM(amount) FROM expenses WHERE user_id=%s", (user_id,))
+        total_expenses = cursor.fetchone()[0] or 0
         await query.edit_message_text(f"📊 Расходы с момента доходов: {total_expenses} zł")
 
     elif query.data == "balance":
         income = context.user_data.get("income", 0)
-        total_expenses = 0
-        if os.path.exists(file_name):
-            with open(file_name, 'r', encoding='utf-8') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    total_expenses += float(row['amount'])
+        cursor.execute("SELECT SUM(amount) FROM expenses WHERE user_id=%s", (user_id,))
+        total_expenses = cursor.fetchone()[0] or 0
         balance = income - total_expenses
         await query.edit_message_text(f"💵 Остаток: {balance} zł")
 
-# --- обработчик сообщений ---
+# --- Обработчик сообщений ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    file_name = f"expenses_{user.id}.csv"
-
-    # --- создаем файл, если его нет ---
-    if not os.path.exists(file_name):
-        with open(file_name, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(['date', 'amount', 'category'])
-
+    user_id = user.id
     text = update.message.text.strip()
 
-    # --- проверка, ждем ли доход ---
+    # --- Если ждем доход ---
     if context.user_data.get("awaiting_income"):
         try:
             income = float(text)
@@ -84,18 +88,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Введите число для дохода")
         return
 
-    # --- запись расходов ---
+    # --- Иначе считаем расход ---
     try:
         amount, category = text.split(maxsplit=1)
         amount = float(amount)
 
-        with open(file_name, 'a', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                datetime.now().strftime('%d-%m-%Y %H:%M'),
-                amount,
-                category
-            ])
+        cursor.execute(
+            "INSERT INTO expenses (user_id, date, amount, category) VALUES (%s, NOW(), %s, %s)",
+            (user_id, amount, category)
+        )
+        conn.commit()
+
         await update.message.reply_text(f"✅ Записал: {amount} zł — {category}")
     except:
         await update.message.reply_text(
@@ -103,7 +106,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown'
         )
 
-# --- создание и запуск приложения ---
+# --- Создание и запуск приложения ---
+TOKEN = os.getenv("BOT_TOKEN")
 app = ApplicationBuilder().token(TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("menu", menu))
