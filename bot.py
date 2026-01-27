@@ -1,3 +1,6 @@
+import os
+from threading import Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -7,9 +10,7 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
-from datetime import datetime
 import psycopg2
-import os
 
 # --- Подключение к базе PostgreSQL ---
 conn = psycopg2.connect(
@@ -20,7 +21,7 @@ conn = psycopg2.connect(
 )
 cursor = conn.cursor()
 
-# --- Создание таблиц, если их нет ---
+# --- Создание таблиц ---
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS expenses (
     id SERIAL PRIMARY KEY,
@@ -40,7 +41,21 @@ CREATE TABLE IF NOT EXISTS income (
 """)
 conn.commit()
 
-# --- Функция для создания кнопок ---
+# --- HTTP-сервер для Render ---
+PORT = int(os.getenv("PORT", 10000))  # Render автоматически задаёт PORT
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running")
+
+def run_server():
+    server = HTTPServer(('0.0.0.0', PORT), Handler)
+    server.serve_forever()
+
+Thread(target=run_server, daemon=True).start()  # запускаем сервер в фоне
+
+# --- Функция для кнопок ---
 def get_main_keyboard():
     keyboard = [
         [InlineKeyboardButton("💰 Принять доходы", callback_data="income")],
@@ -49,7 +64,7 @@ def get_main_keyboard():
     ]
     return InlineKeyboardMarkup(keyboard)
 
-# --- /start с кнопками сразу ---
+# --- /start с кнопками ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Привет!\n\n"
@@ -59,7 +74,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`1200 аренда`\n\n"
         "Выбери действие в меню ниже ⬇️",
         parse_mode="Markdown",
-        reply_markup=get_main_keyboard()  # кнопки сразу при старте
+        reply_markup=get_main_keyboard()
     )
 
 # --- Обработчик кнопок ---
@@ -73,7 +88,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['awaiting_income'] = True
 
     elif query.data == "expenses":
-        # Получаем дату последнего дохода
         cursor.execute(
             "SELECT date FROM income WHERE user_id=%s ORDER BY date DESC LIMIT 1",
             (user_id,)
@@ -93,11 +107,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_expenses = cursor.fetchone()[0] or 0
         await query.edit_message_text(
             f"📊 Расходы с момента доходов: {total_expenses} zł",
-            reply_markup=get_main_keyboard()  # повторно показываем кнопки
+            reply_markup=get_main_keyboard()
         )
 
     elif query.data == "balance":
-        # Последний доход
         cursor.execute(
             "SELECT amount, date FROM income WHERE user_id=%s ORDER BY date DESC LIMIT 1",
             (user_id,)
@@ -113,12 +126,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             balance = last_income - total_expenses
             await query.edit_message_text(
                 f"💵 Остаток: {balance} zł",
-                reply_markup=get_main_keyboard()  # повторно показываем кнопки
+                reply_markup=get_main_keyboard()
             )
         else:
             await query.edit_message_text(
                 "❌ Доходы не заданы. Сначала введите доход.",
-                reply_markup=get_main_keyboard()  # повторно показываем кнопки
+                reply_markup=get_main_keyboard()
             )
 
 # --- Обработчик сообщений ---
@@ -147,7 +160,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         amount, category = text.split(maxsplit=1)
         amount = float(amount)
-
         cursor.execute(
             "INSERT INTO expenses (user_id, date, amount, category) VALUES (%s, NOW(), %s, %s)",
             (user_id, amount, category)
@@ -162,7 +174,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_main_keyboard()
         )
 
-# --- Создание и запуск приложения ---
+# --- Запуск приложения ---
 TOKEN = os.getenv("BOT_TOKEN")
 app = ApplicationBuilder().token(TOKEN).build()
 app.add_handler(CommandHandler("start", start))
