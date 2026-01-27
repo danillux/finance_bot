@@ -26,7 +26,10 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"OK")
 
-Thread(target=lambda: HTTPServer(("0.0.0.0", PORT), Handler).serve_forever(), daemon=True).start()
+Thread(
+    target=lambda: HTTPServer(("0.0.0.0", PORT), Handler).serve_forever(),
+    daemon=True
+).start()
 
 # БАЗА
 cursor.execute("""
@@ -55,7 +58,7 @@ conn.commit()
 keyboard = ReplyKeyboardMarkup(
     [
         ["👤 Профиль"],
-        ["💰 Принять доходы", "📊 Показать расходы"],
+        ["💰 Принять доходы", "📊 Статистика"],
         ["💵 Показать остаток"]
     ],
     resize_keyboard=True
@@ -92,19 +95,20 @@ def ensure_profile(user):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_profile(update.effective_user)
     await update.message.reply_text(
-        "👋 Добро пожаловать в финансовый бот 💸\n"
+        "👋 Привет!\n\n"
+        "Я бот для учёта финансов 💸\n"
         "Расходы вводи так: `500 еда`",
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
 
-# ОБРАБОТКА ТЕКСТА
+# ОБРАБОТКА
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     user = update.effective_user
     ensure_profile(user)
 
-    # ---- ПРОФИЛЬ ----
+    # ---------- ПРОФИЛЬ ----------
     if text == "👤 Профиль":
         cursor.execute("SELECT balance FROM profile WHERE user_id=%s", (user.id,))
         balance = cursor.fetchone()[0]
@@ -117,32 +121,38 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         expenses = cursor.fetchone()[0]
 
         cursor.execute("""
-            SELECT date, amount FROM operations
+            SELECT date, amount
+            FROM operations
             WHERE user_id=%s AND type='income'
             ORDER BY date DESC
+            LIMIT 5
         """, (user.id,))
         incomes = cursor.fetchall()
 
-        history = "\n".join([f"{d:%d.%m} +{a} zł" for d,a in incomes]) or "нет"
+        history = "\n".join(
+            [f"• {d:%d.%m} +{a} zł" for d, a in incomes]
+        ) or "нет"
 
         await update.message.reply_text(
             f"👤 @{user.username}\n\n"
             f"💵 Баланс: {balance} zł\n"
             f"📊 Расходы за месяц: {expenses} zł\n\n"
-            f"💰 История доходов:\n{history}",
+            f"💰 Последние доходы:\n{history}",
             reply_markup=keyboard
         )
         return
 
-    # ---- ДОХОД ----
+    # ---------- ДОХОД ----------
     if text == "💰 Принять доходы":
-        context.user_data["income"] = True
+        context.user_data["awaiting_income"] = True
         await update.message.reply_text("💰 Введите сумму дохода:")
         return
 
-    if context.user_data.get("income"):
+    if context.user_data.get("awaiting_income"):
         try:
             value = float(text)
+            if value <= 0:
+                raise ValueError
 
             cursor.execute(
                 "UPDATE profile SET balance = balance + %s WHERE user_id=%s",
@@ -154,16 +164,75 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             conn.commit()
 
-            context.user_data["income"] = False
+            context.user_data["awaiting_income"] = False
             await update.message.reply_text(f"✅ Доход +{value} zł", reply_markup=keyboard)
         except:
-            await update.message.reply_text("❌ Введите число")
+            await update.message.reply_text("❌ Введите корректное число")
         return
 
-    # ---- РАСХОД ----
+    # ---------- СТАТИСТИКА ----------
+    if text == "📊 Статистика":
+        cursor.execute("""
+            SELECT COUNT(*) FROM operations
+            WHERE user_id=%s AND type='expense'
+        """, (user.id,))
+        count = cursor.fetchone()[0]
+
+        cursor.execute("""
+            SELECT category, SUM(amount)
+            FROM operations
+            WHERE user_id=%s AND type='expense'
+            GROUP BY category
+            ORDER BY SUM(amount) DESC
+            LIMIT 5
+        """, (user.id,))
+        categories = cursor.fetchall()
+
+        cursor.execute("""
+            SELECT MAX(amount)
+            FROM operations
+            WHERE user_id=%s AND type='expense'
+        """, (user.id,))
+        max_expense = cursor.fetchone()[0] or 0
+
+        cat_text = "\n".join(
+            [f"• {c}: {a} zł" for c, a in categories]
+        ) or "нет"
+
+        await update.message.reply_text(
+            "📊 *Статистика за месяц*\n\n"
+            f"🧾 Кол-во расходов: {count}\n"
+            f"💸 Самый большой расход: {max_expense} zł\n\n"
+            f"🏷 Топ категорий:\n{cat_text}",
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
+        return
+
+    # ---------- ОСТАТОК ----------
+    if text == "💵 Показать остаток":
+        cursor.execute("SELECT balance FROM profile WHERE user_id=%s", (user.id,))
+        balance = cursor.fetchone()[0]
+        await update.message.reply_text(f"💵 Остаток: {balance} zł", reply_markup=keyboard)
+        return
+
+    # ---------- РАСХОД ----------
     try:
         amount, category = text.split(maxsplit=1)
         amount = float(amount)
+
+        if amount <= 0:
+            raise ValueError
+
+        cursor.execute("SELECT balance FROM profile WHERE user_id=%s", (user.id,))
+        balance = cursor.fetchone()[0]
+
+        if amount > balance:
+            await update.message.reply_text(
+                f"❌ Недостаточно средств\nБаланс: {balance} zł",
+                reply_markup=keyboard
+            )
+            return
 
         cursor.execute(
             "UPDATE profile SET balance = balance - %s WHERE user_id=%s",
@@ -175,9 +244,15 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         conn.commit()
 
-        await update.message.reply_text(f"✅ Расход: {amount} zł — {category}", reply_markup=keyboard)
+        await update.message.reply_text(
+            f"✅ Расход: {amount} zł — {category}",
+            reply_markup=keyboard
+        )
     except:
-        await update.message.reply_text("❌ Формат: `500 еда`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "❌ Формат: `500 еда`",
+            parse_mode="Markdown"
+        )
 
 # ЗАПУСК
 app = ApplicationBuilder().token(TOKEN).build()
