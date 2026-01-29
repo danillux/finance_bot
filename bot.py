@@ -1,3 +1,9 @@
+import os
+import csv
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from datetime import datetime
+
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     ApplicationBuilder,
@@ -6,14 +12,27 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from datetime import datetime
-import csv
-import os
 
+# ================== НАСТРОЙКИ ==================
 TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = 123456789  # <-- ВСТАВЬ СВОЙ TELEGRAM ID
+PORT = int(os.getenv("PORT", 10000))
 
-# ---------- КНОПКИ ----------
-MAIN_KEYBOARD = ReplyKeyboardMarkup(
+# ================== HTTP SERVER (RENDER) ==================
+class DummyHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running")
+
+def run_server():
+    server = HTTPServer(("0.0.0.0", PORT), DummyHandler)
+    server.serve_forever()
+
+threading.Thread(target=run_server, daemon=True).start()
+
+# ================== КНОПКИ ==================
+KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("👤 Профиль")],
         [KeyboardButton("💰 Принять доход")],
@@ -24,175 +43,103 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-# ---------- ВСПОМОГАТЕЛЬНЫЕ ----------
-def get_file(user_id):
+# ================== ФАЙЛЫ ==================
+def file_name(user_id):
     return f"finance_{user_id}.csv"
 
-
 def init_file(user_id):
-    file = get_file(user_id)
-    if not os.path.exists(file):
-        with open(file, "w", newline="", encoding="utf-8") as f:
+    if not os.path.exists(file_name(user_id)):
+        with open(file_name(user_id), "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["date", "type", "amount", "category"])
 
-
 def read_data(user_id):
     init_file(user_id)
-    data = []
-    with open(get_file(user_id), encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            data.append(row)
-    return data
-
+    with open(file_name(user_id), encoding="utf-8") as f:
+        return list(csv.DictReader(f))
 
 def write_row(user_id, row):
-    init_file(user_id)
-    with open(get_file(user_id), "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(row)
+    with open(file_name(user_id), "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(row)
 
-
-def calculate_balance(data):
-    balance = 0
-    expenses = 0
-    income = 0
-    for row in data:
-        amount = float(row["amount"])
-        if row["type"] == "income":
-            balance += amount
-            income += amount
+def calc(data):
+    balance = income = expenses = 0
+    for r in data:
+        a = float(r["amount"])
+        if r["type"] == "income":
+            income += a
+            balance += a
         else:
-            balance -= amount
-            expenses += amount
+            expenses += a
+            balance -= a
     return balance, income, expenses
 
-
-# ---------- КОМАНДЫ ----------
+# ================== КОМАНДЫ ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text(
-        "👋 Привет!\n\n"
-        "Я бот для учёта финансов 💸\n\n"
-        "• Доходы\n"
-        "• Расходы\n"
-        "• Баланс и статистика\n\n"
-        "Выбирай действие кнопками ниже 👇",
-        reply_markup=MAIN_KEYBOARD,
+        "👋 Бот учёта финансов\n\n"
+        "• Доходы\n• Расходы\n• Баланс\n\n"
+        "Выбирай кнопками 👇",
+        reply_markup=KEYBOARD,
     )
-
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
+    await update.message.reply_text("❌ Отменено", reply_markup=KEYBOARD)
+
+# ================== АДМИН ==================
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    users = [
+        f.replace("finance_", "").replace(".csv", "")
+        for f in os.listdir()
+        if f.startswith("finance_")
+    ]
+
+    text = "👑 Пользователи:\n\n"
+    for u in users:
+        bal, _, _ = calc(read_data(u))
+        text += f"ID {u} — {bal:.2f} zł\n"
+
+    await update.message.reply_text(text)
+
+async def user_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    uid = context.args[0]
+    bal, inc, exp = calc(read_data(uid))
     await update.message.reply_text(
-        "❌ Действие отменено",
-        reply_markup=MAIN_KEYBOARD,
+        f"ID {uid}\n💰 {inc}\n📉 {exp}\n💵 {bal}"
     )
 
+async def user_expenses(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    uid = context.args[0]
+    data = read_data(uid)
+    text = "📊 Расходы:\n"
+    for r in data:
+        if r["type"] == "expense":
+            text += f"{r['amount']} — {r['category']}\n"
+    await update.message.reply_text(text)
 
-# ---------- ОСНОВНОЙ ОБРАБОТЧИК ----------
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ================== ОСНОВНАЯ ЛОГИКА ==================
+async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     user = update.effective_user
-    user_id = user.id
-    data = read_data(user_id)
+    uid = user.id
+    data = read_data(uid)
 
-    # ---------- ОТМЕНА ----------
-    if text == "❌ Отмена":
+    # ---- КНОПКИ (ВСЕГДА ПЕРВЫЕ) ----
+    if text in ["👤 Профиль", "💰 Принять доход", "📊 Показать расходы", "💵 Показать остаток", "❌ Отмена"]:
         context.user_data.clear()
-        await update.message.reply_text("❌ Всё отменено", reply_markup=MAIN_KEYBOARD)
-        return
 
-    # ---------- ПРОФИЛЬ ----------
     if text == "👤 Профиль":
-        balance, income, expenses = calculate_balance(data)
+        bal, inc, exp = calc(data)
         await update.message.reply_text(
-            f"👤 *Профиль*\n\n"
-            f"Имя: {user.first_name}\n"
-            f"💰 Доходы: {income:.2f} zł\n"
-            f"📉 Расходы: {expenses:.2f} zł\n"
-            f"💵 Баланс: {balance:.2f} zł",
-            parse_mode="Markdown",
+            f"👤 {user.first_name}\n"
+            f"💰 {inc}\n📉 {exp}\n💵 {bal}",
         )
-        return
-
-    # ---------- ПРИНЯТЬ ДОХОД ----------
-    if text == "💰 Принять доход":
-        context.user_data.clear()
-        context.user_data["awaiting_income"] = True
-        await update.message.reply_text("💰 Введите сумму дохода:")
-        return
-
-    # ---------- ПОКАЗАТЬ РАСХОДЫ ----------
-    if text == "📊 Показать расходы":
-        _, _, expenses = calculate_balance(data)
-        await update.message.reply_text(f"📊 Всего расходов: {expenses:.2f} zł")
-        return
-
-    # ---------- ПОКАЗАТЬ ОСТАТОК ----------
-    if text == "💵 Показать остаток":
-        balance, _, _ = calculate_balance(data)
-        await update.message.reply_text(f"💵 Текущий баланс: {balance:.2f} zł")
-        return
-
-    # ---------- ВВОД ДОХОДА ----------
-    if context.user_data.get("awaiting_income"):
-        try:
-            amount = float(text)
-            if amount <= 0:
-                raise ValueError
-            write_row(
-                user_id,
-                [datetime.now(), "income", amount, "доход"],
-            )
-            context.user_data.clear()
-            await update.message.reply_text(
-                f"✅ Доход {amount:.2f} zł добавлен",
-                reply_markup=MAIN_KEYBOARD,
-            )
-        except:
-            await update.message.reply_text("❌ Введите корректное число")
-        return
-
-    # ---------- ВВОД РАСХОДА ----------
-    try:
-        amount, category = text.split(maxsplit=1)
-        amount = float(amount)
-
-        balance, _, _ = calculate_balance(data)
-        if amount <= 0:
-            raise ValueError
-
-        if balance - amount < 0:
-            await update.message.reply_text(
-                "🚫 Недостаточно средств.\n"
-                f"Текущий баланс: {balance:.2f} zł"
-            )
-            return
-
-        write_row(
-            user_id,
-            [datetime.now(), "expense", amount, category],
-        )
-        await update.message.reply_text(
-            f"✅ Расход {amount:.2f} zł — {category}",
-            reply_markup=MAIN_KEYBOARD,
-        )
-
-    except:
-        await update.message.reply_text(
-            "❌ Формат расхода:\n`500 еда`",
-            parse_mode="Markdown",
-        )
-
-
-# ---------- ЗАПУСК ----------
-app = ApplicationBuilder().token(TOKEN).build()
-
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("cancel", cancel))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-print("Бот запущен...")
-app.run_polling()
