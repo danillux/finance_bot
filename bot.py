@@ -62,7 +62,6 @@ KB = ReplyKeyboardMarkup(
         ["👤 Профиль"],
         ["💰 Доход", "💸 Расход"],
         ["📊 Месяц"],
-        ["❌ Отмена"],
     ],
     resize_keyboard=True
 )
@@ -94,10 +93,6 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     reg(update.effective_user)
     ctx.user_data.clear()
     await update.message.reply_text("👋 Учет финансов", reply_markup=KB)
-
-async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data.clear()
-    await update.message.reply_text("❌ Отменено", reply_markup=KB)
 
 async def history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
