@@ -5,203 +5,125 @@ from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import (
-    ApplicationBuilder,
-    ContextTypes,
-    CommandHandler,
-    MessageHandler,
-    filters,
-)
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 
-# НАСТРОЙКИ
+# ================= CONFIG =================
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = 415300131
 PORT = int(os.getenv("PORT", 10000))
 
-DB_CONFIG = {
+DB = {
     "host": os.getenv("DB_HOST"),
     "dbname": os.getenv("DB_NAME"),
     "user": os.getenv("DB_USER"),
     "password": os.getenv("DB_PASSWORD"),
 }
 
-# PORT FIX (RENDER)
-class PingHandler(BaseHTTPRequestHandler):
+# ================= RENDER PORT =================
+class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"OK")
 
-def run_server():
-    HTTPServer(("0.0.0.0", PORT), PingHandler).serve_forever()
+threading.Thread(
+    target=lambda: HTTPServer(("0.0.0.0", PORT), Handler).serve_forever(),
+    daemon=True
+).start()
 
-threading.Thread(target=run_server, daemon=True).start()
-
-# DB
-def get_conn():
-    return psycopg2.connect(**DB_CONFIG)
+# ================= DB =================
+def conn():
+    return psycopg2.connect(**DB)
 
 def init_db():
-    with get_conn() as conn:
-        with conn.cursor() as cur:
+    with conn() as c:
+        with c.cursor() as cur:
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    id BIGINT PRIMARY KEY,
-                    username TEXT,
-                    first_name TEXT
-                );
-                CREATE TABLE IF NOT EXISTS transactions (
-                    id SERIAL PRIMARY KEY,
-                    user_id BIGINT REFERENCES users(id),
-                    type TEXT CHECK (type IN ('income','expense')),
-                    amount NUMERIC,
-                    category TEXT,
-                    created_at TIMESTAMP DEFAULT NOW()
-                );
+            CREATE TABLE IF NOT EXISTS users (
+                id BIGINT PRIMARY KEY,
+                username TEXT,
+                first_name TEXT
+            );
+            CREATE TABLE IF NOT EXISTS transactions (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT REFERENCES users(id),
+                type TEXT,
+                amount NUMERIC,
+                category TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
             """)
 
 init_db()
 
-# KEYBOARD
-KEYBOARD = ReplyKeyboardMarkup(
+# ================= UI =================
+KB = ReplyKeyboardMarkup(
     [
-        [KeyboardButton("👤 Профиль")],
-        [KeyboardButton("💰 Принять доход")],
-        [KeyboardButton("📊 Показать расходы")],
-        [KeyboardButton("💵 Показать остаток")],
-        [KeyboardButton("❌ Отмена")],
+        ["👤 Профиль"],
+        ["💰 Доход", "💸 Расход"],
+        ["📊 Месяц"],
+        ["❌ Отмена"],
     ],
-    resize_keyboard=True,
+    resize_keyboard=True
 )
 
-# HELPERS
-def register_user(user):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
+# ================= HELPERS =================
+def reg(user):
+    with conn() as c:
+        with c.cursor() as cur:
             cur.execute("""
-                INSERT INTO users (id, username, first_name)
-                VALUES (%s,%s,%s)
-                ON CONFLICT (id) DO NOTHING
+            INSERT INTO users (id, username, first_name)
+            VALUES (%s,%s,%s)
+            ON CONFLICT DO NOTHING
             """, (user.id, user.username, user.first_name))
 
-def stats(user_id):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
+def balance(uid):
+    with conn() as c:
+        with c.cursor() as cur:
             cur.execute("""
-                SELECT
-                  COALESCE(SUM(CASE WHEN type='income' THEN amount END),0),
-                  COALESCE(SUM(CASE WHEN type='expense' THEN amount END),0)
-                FROM transactions WHERE user_id=%s
-            """, (user_id,))
-            income, expense = cur.fetchone()
-            return float(income - expense), float(income), float(expense)
+            SELECT
+            COALESCE(SUM(CASE WHEN type='income' THEN amount END),0),
+            COALESCE(SUM(CASE WHEN type='expense' THEN amount END),0)
+            FROM transactions WHERE user_id=%s
+            """, (uid,))
+            inc, exp = cur.fetchone()
+            return float(inc), float(exp), float(inc-exp)
 
-# COMMANDS 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    register_user(update.effective_user)
-    context.user_data.clear()
-    await update.message.reply_text(
-        "👋 Бот учёта финансов\n\n"
-        "Выбирай действие кнопками 👇",
-        reply_markup=KEYBOARD,
-    )
+# ================= COMMANDS =================
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    reg(update.effective_user)
+    ctx.user_data.clear()
+    await update.message.reply_text("👋 Учет финансов", reply_markup=KB)
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.message.reply_text("❌ Отменено", reply_markup=KEYBOARD)
+async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.clear()
+    await update.message.reply_text("❌ Отменено", reply_markup=KB)
 
-# ADMIN
-async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+async def history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    with conn() as c:
+        with c.cursor() as cur:
+            cur.execute("""
+            SELECT id, type, amount, category, created_at
+            FROM transactions
+            WHERE user_id=%s
+            ORDER BY id DESC LIMIT 10
+            """, (uid,))
+            rows = cur.fetchall()
+
+    if not rows:
+        await update.message.reply_text("История пуста")
         return
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT u.id, u.first_name,
-                COALESCE(SUM(CASE WHEN t.type='income' THEN t.amount END),0) -
-                COALESCE(SUM(CASE WHEN t.type='expense' THEN t.amount END),0)
-                FROM users u
-                LEFT JOIN transactions t ON t.user_id=u.id
-                GROUP BY u.id
-            """)
-            text = "👑 Пользователи:\n\n"
-            for uid, name, bal in cur.fetchall():
-                text += f"{name} ({uid}) — {bal} zł\n"
+
+    text = "📜 Последние операции:\n\n"
+    for i,t,a,cg,dt in rows:
+        text += f"#{i} {t} {a} {cg} ({dt:%d.%m})\n"
     await update.message.reply_text(text)
 
-# MAIN HANDLER
-async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    user = update.effective_user
-    uid = user.id
-    register_user(user)
-
-    if text in ["👤 Профиль","💰 Принять доход","📊 Показать расходы","💵 Показать остаток","❌ Отмена"]:
-        context.user_data.clear()
-
-    if text == "👤 Профиль":
-        bal, inc, exp = stats(uid)
-        await update.message.reply_text(
-            f"👤 {user.first_name}\n"
-            f"💰 Доходы: {inc}\n"
-            f"📉 Расходы: {exp}\n"
-            f"💵 Баланс: {bal}"
-        )
-        return
-
-    if text == "💰 Принять доход":
-        context.user_data["wait_income"] = True
-        await update.message.reply_text("Введите сумму дохода:")
-        return
-
-    if text == "📊 Показать расходы":
-        _, _, exp = stats(uid)
-        await update.message.reply_text(f"📊 Расходы: {exp}")
-        return
-
-    if text == "💵 Показать остаток":
-        bal, _, _ = stats(uid)
-        await update.message.reply_text(f"💵 Баланс: {bal}")
-        return
-
-    if context.user_data.get("wait_income"):
-        try:
-            amount = float(text)
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "INSERT INTO transactions (user_id,type,amount,category) VALUES (%s,'income',%s,'доход')",
-                        (uid, amount),
-                    )
-            context.user_data.clear()
-            await update.message.reply_text("✅ Доход добавлен", reply_markup=KEYBOARD)
-        except:
-            await update.message.reply_text("❌ Введите корректное число")
-        return
-
+async def delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
     try:
-        amount, category = text.split(maxsplit=1)
-        amount = float(amount)
-        bal, _, _ = stats(uid)
-        if bal - amount < 0:
-            await update.message.reply_text("🚫 Недостаточно средств")
-            return
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO transactions (user_id,type,amount,category) VALUES (%s,'expense',%s,%s)",
-                    (uid, amount, category),
-                )
-        await update.message.reply_text("✅ Расход записан", reply_markup=KEYBOARD)
-    except:
-        await update.message.reply_text("❌ Формат: `500 еда`", parse_mode="Markdown")
-
-# RUN
-app = ApplicationBuilder().token(TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("cancel", cancel))
-app.add_handler(CommandHandler("admin", admin))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handler))
-
-print("Bot started")
-app.run_polling()
+        tid = int(ctx.args[0])
+        with conn() as c:
+            with c.cursor() as cur:
+                cur.execute("DELETE FROM transactions WHERE id=%s AND user_id=%s", (tid, uid))
