@@ -8,7 +8,8 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    ReplyKeyboardMarkup
+    ReplyKeyboardMarkup,
+    Bot
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -23,6 +24,8 @@ from telegram.ext import (
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 PORT = int(os.getenv("PORT", 10000))
+bot = Bot(TOKEN)
+bot.get_updates(offset=-1)
 
 # ================== HTTP SERVER (FOR RENDER) ==================
 class Handler(BaseHTTPRequestHandler):
