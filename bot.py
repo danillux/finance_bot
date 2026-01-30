@@ -1,6 +1,9 @@
 import os
 import psycopg2
 from datetime import datetime
+from threading import Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -16,12 +19,24 @@ from telegram.ext import (
     filters
 )
 
-# ===================== CONFIG =====================
+# ================== CONFIG ==================
 TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
 PORT = int(os.getenv("PORT", 10000))
 
-# ===================== DB =====================
+# ================== HTTP SERVER (FOR RENDER) ==================
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running")
+
+Thread(
+    target=lambda: HTTPServer(("0.0.0.0", PORT), Handler).serve_forever(),
+    daemon=True
+).start()
+
+# ================== DATABASE ==================
 def conn():
     return psycopg2.connect(
         host=os.getenv("DB_HOST"),
@@ -43,40 +58,43 @@ def init_db():
                 )
             """)
 
-# ===================== MIDDLEWARE =====================
+# ================== MIDDLEWARE ==================
 def reset_state(ctx):
     ctx.user_data.clear()
 
-async def admin_only(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def admin_only(update: Update, ctx):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⛔ Только для администратора")
         return False
     return True
 
-# ===================== UI =====================
+# ================== UI ==================
 MAIN_MENU = ReplyKeyboardMarkup(
-    [["💰 Доход", "📊 Расходы"], ["💵 Баланс", "👤 Профиль"]],
+    [
+        ["💰 Доход", "📊 Расходы"],
+        ["💵 Баланс", "👤 Профиль"]
+    ],
     resize_keyboard=True
 )
 
-# ===================== COMMANDS =====================
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+# ================== COMMANDS ==================
+async def start(update: Update, ctx):
     reset_state(ctx)
     await update.message.reply_text(
         "👋 Бот учета финансов\n\n"
-        "• Введите расход: `500 еда`\n"
-        "• Доход — кнопка 💰\n"
-        "• /cancel — отмена",
+        "✏️ Расход: `500 еда`\n"
+        "💰 Доход — кнопка\n"
+        "❌ /cancel — отмена",
         parse_mode="Markdown",
         reply_markup=MAIN_MENU
     )
 
-async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cancel(update: Update, ctx):
     reset_state(ctx)
-    await update.message.reply_text("❌ Действие отменено", reply_markup=MAIN_MENU)
+    await update.message.reply_text("❌ Отменено", reply_markup=MAIN_MENU)
 
-# ===================== BUTTON MENU =====================
-async def menu_buttons(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+# ================== MENU ==================
+async def menu(update: Update, ctx):
     reset_state(ctx)
     text = update.message.text
 
@@ -97,23 +115,23 @@ async def menu_buttons(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await profile(update, ctx)
         return
 
-# ===================== EXPENSES =====================
-async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+# ================== TEXT HANDLER ==================
+async def handle_text(update: Update, ctx):
     uid = update.effective_user.id
     text = update.message.text.strip()
 
-    # income
+    # доход
     if ctx.user_data.get("await_income"):
         try:
             amount = float(text)
             ctx.user_data["income"] = ctx.user_data.get("income", 0) + amount
             ctx.user_data["await_income"] = False
-            await update.message.reply_text(f"✅ Доход: {amount}")
+            await update.message.reply_text(f"✅ Доход добавлен: {amount}")
         except:
             await update.message.reply_text("❌ Введите число")
         return
 
-    # expense
+    # расход
     try:
         amount, category = text.split(maxsplit=1)
         amount = float(amount)
@@ -130,15 +148,15 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"✅ Расход: {amount} — {category}")
 
-# ===================== SHOW =====================
-async def show_expenses(update: Update, ctx):
+# ================== SHOW ==================
+async def show_expenses(update, ctx):
     uid = update.effective_user.id
     kb = []
 
     with conn() as c:
         with c.cursor() as cur:
             cur.execute(
-                "SELECT id, amount, category FROM transactions WHERE user_id=%s ORDER BY id DESC LIMIT 5",
+                "SELECT id, amount, category FROM transactions WHERE user_id=%s ORDER BY id DESC LIMIT 10",
                 (uid,)
             )
             rows = cur.fetchall()
@@ -159,8 +177,9 @@ async def show_expenses(update: Update, ctx):
         reply_markup=InlineKeyboardMarkup(kb)
     )
 
-async def show_balance(update: Update, ctx):
+async def show_balance(update, ctx):
     uid = update.effective_user.id
+
     with conn() as c:
         with c.cursor() as cur:
             cur.execute(
@@ -173,23 +192,28 @@ async def show_balance(update: Update, ctx):
     balance = income - spent
 
     await update.message.reply_text(
-        f"💵 Баланс:\nДоход: {income}\nРасходы: {spent}\n\nИтого: {balance}"
+        f"💵 Баланс\n\n"
+        f"Доход: {income}\n"
+        f"Расходы: {spent}\n"
+        f"──────────\n"
+        f"Итого: {balance}"
     )
 
-async def profile(update: Update, ctx):
-    uid = update.effective_user.id
+async def profile(update, ctx):
     await update.message.reply_text(
-        f"👤 Профиль\nID: {uid}\nБаланс: см. кнопку 💵"
+        f"👤 Профиль\n"
+        f"ID: {update.effective_user.id}\n"
+        f"Баланс — кнопка 💵"
     )
 
-# ===================== CALLBACKS =====================
-async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+# ================== CALLBACKS ==================
+async def callbacks(update: Update, ctx):
     query = update.callback_query
     await query.answer()
     reset_state(ctx)
 
-    data = query.data
     uid = query.from_user.id
+    data = query.data
 
     if data.startswith("del:"):
         tid = int(data.split(":")[1])
@@ -200,15 +224,12 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     (tid, uid)
                 )
         await query.edit_message_text("🗑 Удалено")
-        return
 
     if data.startswith("edit:"):
-        tid = int(data.split(":")[1])
-        ctx.user_data["edit_id"] = tid
+        ctx.user_data["edit_id"] = int(data.split(":")[1])
         await query.edit_message_text("✏️ Введите: сумма категория")
-        return
 
-# ===================== EDIT =====================
+# ================== EDIT ==================
 async def edit_handler(update: Update, ctx):
     if "edit_id" not in ctx.user_data:
         return
@@ -232,17 +253,37 @@ async def edit_handler(update: Update, ctx):
 
     await update.message.reply_text("✏️ Обновлено")
 
-# ===================== RUN =====================
+# ================== ADMIN ==================
+async def admin(update: Update, ctx):
+    if not await admin_only(update, ctx):
+        return
+
+    with conn() as c:
+        with c.cursor() as cur:
+            cur.execute(
+                "SELECT user_id, SUM(amount) FROM transactions GROUP BY user_id"
+            )
+            rows = cur.fetchall()
+
+    text = "👮 Админ панель\n\n"
+    for uid, total in rows:
+        text += f"ID {uid}: {total}\n"
+
+    await update.message.reply_text(text)
+
+# ================== RUN ==================
 init_db()
 
 app = ApplicationBuilder().token(TOKEN).build()
 
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("cancel", cancel))
-app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^(💰|📊|💵|👤)"), menu_buttons))
+app.add_handler(CommandHandler("admin", admin))
+
+app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^(💰|📊|💵|👤)"), menu))
 app.add_handler(CallbackQueryHandler(callbacks))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, edit_handler))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-print("Bot running...")
+print("✅ Bot is running")
 app.run_polling()
