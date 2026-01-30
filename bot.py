@@ -122,3 +122,6 @@ async def delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         with conn() as c:
             with c.cursor() as cur:
                 cur.execute("DELETE FROM transactions WHERE id=%s AND user_id=%s", (tid, uid))
+            await update.message.reply_text("🗑 Операция удалена")
+    except Exception as e:
+        await update.message.reply_text("❌ Используй: /delete ID")
