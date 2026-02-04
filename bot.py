@@ -86,36 +86,27 @@ async def start(update: Update, ctx):
     await update.message.reply_text(
         "👋 Бот учета финансов\n\n"
         "✏️ Расход: `500 еда`\n"
-        "💰 Доход — кнопка\n"
-        "❌ /cancel — отмена",
+        "💰 Доход — кнопка",
         parse_mode="Markdown",
         reply_markup=MAIN_MENU
     )
-
-async def cancel(update: Update, ctx):
-    reset_state(ctx)
-    await update.message.reply_text("❌ Отменено", reply_markup=MAIN_MENU)
 
 # ================== MENU ==================
 async def menu(update: Update, ctx):
     reset_state(ctx)
     text = update.message.text
 
-    if text == "💰 Доход":
+    if text == "👤 Профиль":
+        await profile(update, ctx)
+        return
+
+    if text == "💰 Доходы":
         ctx.user_data["await_income"] = True
-        await update.message.reply_text("Введите сумму дохода:")
+        await update.message.reply_text("Введите сумму дохода")
         return
 
     if text == "📊 Расходы":
         await show_expenses(update, ctx)
-        return
-
-    if text == "💵 Баланс":
-        await show_balance(update, ctx)
-        return
-
-    if text == "👤 Профиль":
-        await profile(update, ctx)
         return
 
 # ================== TEXT HANDLER ==================
@@ -203,11 +194,40 @@ async def show_balance(update, ctx):
     )
 
 async def profile(update, ctx):
-    await update.message.reply_text(
-        f"👤 Профиль\n"
-        f"ID: {update.effective_user.id}\n"
-        f"Баланс — кнопка 💵"
+    uid = update.effective_user.id
+
+    with conn() as c:
+        with c.cursor() as cur:
+            # все расходы
+            cur.execute(
+                "SELECT COALESCE(SUM(amount),0), COUNT(*) FROM transactions WHERE user_id=%s",
+                (uid,)
+            )
+            total_spent, total_count = cur.fetchone()
+
+            # расходы за месяц
+            cur.execute("""
+                SELECT COALESCE(SUM(amount),0), COUNT(*)
+                FROM transactions
+                WHERE user_id=%s
+                AND created_at >= date_trunc('month', CURRENT_DATE)
+            """, (uid,))
+            month_spent, month_count = cur.fetchone()
+
+    income = ctx.user_data.get("income", 0)
+    balance = income - float(total_spent)
+
+    text = (
+        "👤 Профиль\n\n"
+        f"💰 Доходы всего: {income:.2f} zł\n"
+        f"📉 Расходы всего: {float(total_spent):.2f} zł\n"
+        f"💵 Баланс: {balance:.2f} zł\n\n"
+        "📅 За этот месяц:\n"
+        f"— операций: {month_count}\n"
+        f"— потрачено: {float(month_spent):.2f} zł"
     )
+
+    await update.message.reply_text(text)
 
 # ================== CALLBACKS ==================
 async def callbacks(update: Update, ctx):
@@ -280,7 +300,6 @@ init_db()
 app = ApplicationBuilder().token(TOKEN).build()
 
 app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("cancel", cancel))
 app.add_handler(CommandHandler("admin", admin))
 
 app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^(💰|📊|💵|👤)"), menu))
